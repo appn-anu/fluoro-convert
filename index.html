@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fluoro-convert - CLR to JPG</title>
+<style>
+  :root { color-scheme: light dark; --line: #8886; --accent: #2a7; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 0 auto; padding: 16px; max-width: 1100px; }
+  h1 { font-size: 1.2rem; margin: 0 0 4px; }
+  p { margin: 4px 0 12px; }
+  .muted { opacity: .7; font-size: .9em; }
+  #drop { border: 2px dashed var(--line); border-radius: 8px; padding: 28px 16px; text-align: center; cursor: pointer; }
+  #drop.over { border-color: var(--accent); background: #2a71; }
+  #status { min-height: 1.4em; margin: 10px 0; }
+  #status.error { color: #d33; }
+  #controls { display: none; flex-wrap: wrap; gap: 10px 20px; align-items: center; margin: 10px 0; }
+  #controls label { display: flex; align-items: center; gap: 8px; }
+  #controls output { display: inline-block; min-width: 4.5em; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 200px; }
+  button { font: inherit; padding: 5px 12px; cursor: pointer; }
+  canvas { display: none; width: 100%; height: auto; border: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<h1>fluoro-convert - CLR to JPG</h1>
+<p class="muted">Converts a PhenoVation PlantExplorer <code>CLR_*.DAT</code> colour capture to a regular RGB JPG.
+Everything runs in your browser - the file is not uploaded anywhere.</p>
+
+<div id="drop">Drop a <code>CLR_*.DAT</code> file here, or click to choose one
+  <input id="file" type="file" accept=".dat,.DAT" hidden>
+</div>
+
+<div id="status"></div>
+
+<div id="controls">
+  <label>Brightness <input id="ev" type="range" min="-3" max="4" step="0.05" value="0"><output id="evOut"></output></label>
+  <label>Contrast <input id="contrast" type="range" min="0.5" max="2" step="0.01" value="1"><output id="contrastOut"></output></label>
+  <button id="auto" title="Set brightness from this image's highlights">Auto</button>
+  <button id="reset">Reset</button>
+  <button id="download">Download JPG</button>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script>
+'use strict';
+
+// CLR_*.DAT layout: headerless uint16 LE, three frames (R, G, B) of 2048 x 1500,
+// each stored column-major.
+const W = 2048, H = 1500, FRAMES = 3;
+const EXPECTED_BYTES = W * H * 2 * FRAMES;
+const JUNK_PIXELS = 4;        // first 4 pixels of the top row are not image data
+const BASE_WHITE = 32768;     // raw value mapped to white at brightness 0
+const AUTO_PERCENTILE = 0.999;
+const JPG_QUALITY = 0.95;
+
+const $ = id => document.getElementById(id);
+const drop = $('drop'), fileInput = $('file'), statusEl = $('status'), controls = $('controls');
+const evInput = $('ev'), contrastInput = $('contrast'), canvas = $('canvas');
+const ctx = canvas.getContext('2d');
+
+let rgb = null;       // Uint16Array, row-major, interleaved R,G,B
+let imageData = null;
+let fileName = '';
+let renderQueued = false;
+
+function setStatus(text, isError = false) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('error', isError);
+}
+
+// Column-major planes -> row-major interleaved RGB, with the junk pixels patched.
+function decode(buffer) {
+  const view = new DataView(buffer);
+  const out = new Uint16Array(W * H * 3);
+  for (let c = 0; c < FRAMES; c++) {
+    const frameOffset = c * W * H * 2;
+    for (let x = 0; x < W; x++) {
+      const colOffset = frameOffset + x * H * 2;
+      for (let y = 0; y < H; y++) {
+        out[(y * W + x) * 3 + c] = view.getUint16(colOffset + y * 2, true);
+      }
+    }
+    for (let x = 0; x < JUNK_PIXELS; x++) out[x * 3 + c] = out[JUNK_PIXELS * 3 + c];
+  }
+  return out;
+}
+
+// Raw value -> 8-bit: scale to the white point, sRGB-encode, then contrast about mid-grey.
+function buildLut(ev, contrast) {
+  const white = BASE_WHITE / Math.pow(2, ev);
+  const lut = new Uint8ClampedArray(65536);
+  for (let v = 0; v < 65536; v++) {
+    const lin = Math.min(v / white, 1);
+    const enc = lin <= 0.0031308 ? 12.92 * lin : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055;
+    lut[v] = ((enc - 0.5) * contrast + 0.5) * 255;
+  }
+  return lut;
+}
+
+// Brightness that puts the given percentile (over all three channels) at white.
+function autoEv(data) {
+  const hist = new Uint32Array(65536);
+  for (let i = 0; i < data.length; i++) hist[data[i]]++;
+  const target = data.length * AUTO_PERCENTILE;
+  let seen = 0, v = 0;
+  for (; v < 65536; v++) { seen += hist[v]; if (seen >= target) break; }
+  return Math.log2(BASE_WHITE / Math.max(v, 1));
+}
+
+function render() {
+  renderQueued = false;
+  if (!rgb) return;
+  const ev = +evInput.value, contrast = +contrastInput.value;
+  $('evOut').value = (ev >= 0 ? '+' : '') + ev.toFixed(2) + ' EV';
+  $('contrastOut').value = contrast.toFixed(2) + 'x';
+  const lut = buildLut(ev, contrast);
+  const px = imageData.data;
+  for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
+    px[j] = lut[rgb[i]];
+    px[j + 1] = lut[rgb[i + 1]];
+    px[j + 2] = lut[rgb[i + 2]];
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+function queueRender() {
+  if (!renderQueued) { renderQueued = true; requestAnimationFrame(render); }
+}
+
+function resetSliders() {
+  evInput.value = 0;
+  contrastInput.value = 1;
+}
+
+async function loadFile(file) {
+  if (!file) return;
+  if (file.size !== EXPECTED_BYTES) {
+    setStatus(`${file.name}: expected ${EXPECTED_BYTES.toLocaleString()} bytes ` +
+      `(3 frames of ${W} x ${H}, 16-bit) but got ${file.size.toLocaleString()} - not a CLR capture this tool understands.`, true);
+    return;
+  }
+  setStatus(`Reading ${file.name}...`);
+  try {
+    rgb = decode(await file.arrayBuffer());
+  } catch (err) {
+    setStatus(`${file.name}: could not read file (${err.message})`, true);
+    return;
+  }
+  fileName = file.name;
+  canvas.width = W;
+  canvas.height = H;
+  imageData = ctx.createImageData(W, H);
+  imageData.data.fill(255);   // opaque alpha; render() only writes RGB
+  resetSliders();
+  controls.style.display = 'flex';
+  canvas.style.display = 'block';
+  render();
+  const note = /^CLR_/i.test(file.name) ? '' :
+    ' - note: the name does not start with CLR_, so these may not be red/green/blue frames.';
+  setStatus(`${file.name} - ${W} x ${H}${note}`);
+}
+
+function download() {
+  if (!rgb) return;
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fileName.replace(/\.dat$/i, '') + '.jpg';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, 'image/jpeg', JPG_QUALITY);
+}
+
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => { loadFile(fileInput.files[0]); fileInput.value = ''; });
+
+// Accept drops anywhere on the page, so a near miss does not navigate away to the file.
+window.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+window.addEventListener('dragleave', e => { if (!e.relatedTarget) drop.classList.remove('over'); });
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  loadFile(e.dataTransfer.files[0]);
+});
+
+evInput.addEventListener('input', queueRender);
+contrastInput.addEventListener('input', queueRender);
+$('auto').addEventListener('click', () => {
+  if (!rgb) return;
+  evInput.value = autoEv(rgb);
+  queueRender();
+});
+$('reset').addEventListener('click', () => { resetSliders(); queueRender(); });
+$('download').addEventListener('click', download);
+</script>
+</body>
+</html>
