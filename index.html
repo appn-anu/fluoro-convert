@@ -46,10 +46,11 @@
 <script>
 'use strict';
 
-// CLR_*.DAT layout: headerless uint16 LE, three frames (R, G, B) of 2048 x 1500,
-// each stored column-major.
-const W = 2048, H = 1500, FRAMES = 3;
-const EXPECTED_BYTES = W * H * 2 * FRAMES;
+// CLR_*.DAT layout: headerless uint16 LE, three frames (R, G, B), each stored
+// column-major. Frame size depends on sensor binning; with a fixed frame count the
+// file size says which one it is.
+const FRAMES = 3;
+const FRAME_SIZES = [[2048, 1500], [4096, 3000]];   // binned, unbinned
 const JUNK_PIXELS = 4;        // first 4 pixels of the top row are not image data
 const BASE_WHITE = 32768;     // raw value mapped to white at brightness 0
 const AUTO_PERCENTILE = 0.999;
@@ -61,6 +62,7 @@ const evInput = $('ev'), contrastInput = $('contrast'), canvas = $('canvas');
 const ctx = canvas.getContext('2d');
 
 let rgb = null;       // Uint16Array, row-major, interleaved R,G,B
+let W = 0, H = 0;     // frame size of the loaded file
 let imageData = null;
 let fileName = '';
 let renderQueued = false;
@@ -71,7 +73,7 @@ function setStatus(text, isError = false) {
 }
 
 // Column-major planes -> row-major interleaved RGB, with the junk pixels patched.
-function decode(buffer) {
+function decode(buffer, W, H) {
   const view = new DataView(buffer);
   const out = new Uint16Array(W * H * 3);
   for (let c = 0; c < FRAMES; c++) {
@@ -136,18 +138,23 @@ function resetSliders() {
 
 async function loadFile(file) {
   if (!file) return;
-  if (file.size !== EXPECTED_BYTES) {
-    setStatus(`${file.name}: expected ${EXPECTED_BYTES.toLocaleString()} bytes ` +
-      `(3 frames of ${W} x ${H}, 16-bit) but got ${file.size.toLocaleString()} - not a CLR capture this tool understands.`, true);
+  const size = FRAME_SIZES.find(([w, h]) => file.size === w * h * 2 * FRAMES);
+  if (!size) {
+    const expected = FRAME_SIZES.map(([w, h]) => `${(w * h * 2 * FRAMES).toLocaleString()} (${w} x ${h})`).join(' or ');
+    setStatus(`${file.name}: expected ${expected} bytes for ${FRAMES} 16-bit frames ` +
+      `but got ${file.size.toLocaleString()} - not a CLR capture this tool understands.`, true);
     return;
   }
   setStatus(`Reading ${file.name}...`);
+  let decoded;
   try {
-    rgb = decode(await file.arrayBuffer());
+    decoded = decode(await file.arrayBuffer(), size[0], size[1]);
   } catch (err) {
     setStatus(`${file.name}: could not read file (${err.message})`, true);
     return;
   }
+  rgb = decoded;
+  [W, H] = size;
   fileName = file.name;
   canvas.width = W;
   canvas.height = H;
