@@ -1,3 +1,4 @@
 # test data and machine-specific config
 *.local/
 *.local.*
+*.local
